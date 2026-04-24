@@ -46,6 +46,14 @@ pyyaml==6.0.3
 # ImportError fallback to operator-stripped environments.
 defusedxml==0.7.1
 
+# Required by packages/studio (web UI). Runtime-only; pure-Python except
+# for uvicorn's optional httptools extra.
+fastapi==0.136.1
+uvicorn[standard]==0.46.0
+jinja2==3.1.6
+python-multipart==0.0.26
+markdown==3.10.2
+
 # Optional: For SMT-based constraint analysis (one-gadget feasibility, etc.)
 # z3-solver==4.15.4.0  # see requirements-dev.txt for bookworm/aarch64 cap
 
