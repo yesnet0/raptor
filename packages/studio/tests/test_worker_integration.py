@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from packages.studio.services import jobs as jobs_service
-from packages.studio.services.jobs import Job, JobStatus
+from packages.studio.services.jobs import Job
 
 
 def _wait_terminal(job_id, db_path, timeout=15.0, poll=0.1):
@@ -134,3 +134,37 @@ def test_worker_cancel_stops_long_running_job(isolated_worker):
         time.sleep(0.1)
     final = jobs_reloaded.get(job.id)
     assert final.status == jobs_reloaded.JobStatus.CANCELLED
+
+
+def test_worker_uses_safe_raptor_environment(tmp_path, monkeypatch):
+    from packages.studio.services import worker
+
+    captured = {}
+
+    class FakeProc:
+        pid = 4242
+
+        def wait(self):
+            return 0
+
+    def fake_popen(*args, **kwargs):
+        captured["env"] = kwargs["env"]
+        return FakeProc()
+
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example")
+    monkeypatch.setenv("TERMINAL", "xterm; touch /tmp/pwned")
+    monkeypatch.setattr(worker.jobs, "log_path_for", lambda job_id: tmp_path / f"{job_id}.log")
+    monkeypatch.setattr(worker.jobs, "mark_running", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker.jobs, "mark_finished", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker.jobs, "get", lambda job_id: None)
+    monkeypatch.setattr(worker.subprocess, "Popen", fake_popen)
+
+    job = Job.new(
+        project_name="demo", kind="agentic", target="/tmp",
+        argv=["python3", "-c", "print('ok')"],
+    )
+    worker._run_one_job(job)
+
+    assert captured["env"]["PYTHONUNBUFFERED"] == "1"
+    assert "HTTP_PROXY" not in captured["env"]
+    assert "TERMINAL" not in captured["env"]

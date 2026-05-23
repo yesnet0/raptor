@@ -15,10 +15,10 @@ import os
 import signal
 import subprocess
 import threading
-import time
 from pathlib import Path
 from typing import Optional
 
+from core.config import RaptorConfig
 from packages.studio.config import RAPTOR_HOME, STUDIO_DATA_DIR
 from packages.studio.services import jobs
 
@@ -39,7 +39,8 @@ def _run_one_job(job: jobs.Job) -> None:
             logfile.write(f"[raptor-studio] cwd: {RAPTOR_HOME}\n")
             logfile.flush()
 
-            env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+            env = RaptorConfig.get_safe_env()
+            env["PYTHONUNBUFFERED"] = "1"
             try:
                 proc = subprocess.Popen(
                     job.argv,

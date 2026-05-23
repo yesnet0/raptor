@@ -8,9 +8,11 @@ Read-write web UI for raptor projects.
 from __future__ import annotations
 
 import asyncio
-import json
+import hmac
+import secrets
 from pathlib import Path
 from typing import AsyncIterator, Optional
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
@@ -75,10 +77,14 @@ from packages.studio.services.run_kind import (
 
 BASE_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+_CSRF_FIELD = "csrf_token"
+_CSRF_TOKEN = secrets.token_urlsafe(32)
+_SAFE_FETCH_SITES = frozenset({"same-origin", "same-site", "none"})
 
 # Expose personas_for_finding globally to templates so _finding_detail.html
 # can render persona cards inline without every route having to pass it.
 templates.env.globals["personas_for"] = personas_for_finding
+templates.env.globals["csrf_token"] = _CSRF_TOKEN
 # Markdown filter: `{{ some_md_text | md | safe }}` — for raptor reports.
 templates.env.filters["md"] = render_markdown
 
@@ -91,8 +97,50 @@ def _ctx(**kwargs) -> dict:
         "app_title": APP_TITLE,
         "app_tagline": APP_TAGLINE,
         "raptor_version": raptor_version(),
+        "csrf_token": _CSRF_TOKEN,
         **kwargs,
     }
+
+
+def _default_port(scheme: str) -> Optional[int]:
+    if scheme == "http":
+        return 80
+    if scheme == "https":
+        return 443
+    return None
+
+
+def _same_origin(origin: str, request: Request) -> bool:
+    try:
+        parsed = urlparse(origin)
+        origin_port = parsed.port or _default_port(parsed.scheme)
+    except ValueError:
+        return False
+    if not parsed.scheme or not parsed.hostname:
+        return False
+
+    req_url = request.url
+    request_port = req_url.port or _default_port(req_url.scheme)
+    return (
+        parsed.scheme.lower() == req_url.scheme.lower()
+        and parsed.hostname.lower() == (req_url.hostname or "").lower()
+        and origin_port == request_port
+    )
+
+
+def _require_trusted_post(request: Request, csrf_token: object) -> None:
+    """Reject cross-site or tokenless state-changing requests."""
+    fetch_site = (request.headers.get("sec-fetch-site") or "").lower()
+    if fetch_site and fetch_site not in _SAFE_FETCH_SITES:
+        raise HTTPException(403, "cross-site POST rejected")
+
+    origin = request.headers.get("origin")
+    if origin and not _same_origin(origin, request):
+        raise HTTPException(403, "untrusted POST origin")
+
+    token = str(csrf_token or "")
+    if not hmac.compare_digest(token, _CSRF_TOKEN):
+        raise HTTPException(403, "missing or invalid CSRF token")
 
 
 def _project_ctx(project: RaptorProject, active_stage: str, **extras) -> dict:
@@ -125,7 +173,7 @@ def _cli_hint(stage: str, project: RaptorProject) -> dict:
         "understand":     {"command": f"raptor project use {project.name}\nclaude\n/understand --map", "explanation": "Run inside Claude Code after selecting this project."},
         "scan":           {"command": f"raptor project use {project.name}\npython3 raptor.py scan --repo {target}", "explanation": "Static analysis with Semgrep (and CodeQL if --languages is set)."},
         "validate":       {"command": f"raptor project use {project.name}\nclaude\n/validate", "explanation": "Runs the A–F validation pipeline on existing findings."},
-        "fuzz":           {"command": f"python3 raptor_fuzzing.py --binary <path-to-binary> --autonomous --duration 3600", "explanation": "Binary fuzzing mode — provide a compiled binary, not a repo."},
+        "fuzz":           {"command": "python3 raptor_fuzzing.py --binary <path-to-binary> --autonomous --duration 3600", "explanation": "Binary fuzzing mode — provide a compiled binary, not a repo."},
         "crash-analysis": {"command": "claude\n/crash-analysis <bug-tracker-url> <git-repo-url>", "explanation": "Requires rr on Linux x86_64 and a reproducer input."},
         "oss-forensics":  {"command": "claude\n/oss-forensics <github-url>", "explanation": "Needs GOOGLE_APPLICATION_CREDENTIALS for GH Archive BigQuery."},
     }
@@ -190,6 +238,7 @@ def new_project_form(request: Request):
 @app.post("/projects/new")
 async def new_project_submit(request: Request):
     form = await request.form()
+    _require_trusted_post(request, form.get(_CSRF_FIELD))
     raw = {k: (form.get(k) or "").strip() for k in (
         "name", "target", "description", "output_dir", "notes",
         "project_type",
@@ -383,11 +432,14 @@ def project_settings(request: Request, name: str, save_ok: int = 0):
 
 @app.post("/projects/{name}/settings")
 def project_settings_save(
+    request: Request,
     name: str,
     description: str = Form(""),
     notes: str = Form(""),
+    csrf_token: str = Form(""),
 ):
     """Update description/notes in raptor's project.json. Round-trips the schema."""
+    _require_trusted_post(request, csrf_token)
     from packages.studio.services.raptor_writer import update_project_metadata
     try:
         update_project_metadata(name, description=description, notes=notes)
@@ -464,6 +516,7 @@ async def new_run_submit(request: Request, name: str, kind: str):
     proj = _require_project(name)
     spec = RUNNABLE_KINDS[kind]
     form = await request.form()
+    _require_trusted_post(request, form.get(_CSRF_FIELD))
 
     target = (form.get("target") or "").strip() or _default_target_for(kind, proj)
     values = {f.name: (form.get(f.name) or "").strip() for f in spec.fields}
@@ -528,7 +581,8 @@ def job_detail(request: Request, job_id: str):
 
 
 @app.post("/jobs/{job_id}/cancel")
-def job_cancel(request: Request, job_id: str):
+def job_cancel(request: Request, job_id: str, csrf_token: str = Form("")):
+    _require_trusted_post(request, csrf_token)
     job = jobs_service.get(job_id)
     if job is None:
         raise HTTPException(404, f"job not found: {job_id}")
@@ -714,6 +768,15 @@ _ALLOWED_RUN_FILE_SUFFIXES = frozenset({
     ".py", ".c", ".h", ".sh", ".rb", ".go", ".js", ".ts",
     ".patch", ".diff", ".yaml", ".yml", ".toml", ".log",
 })
+_ARTIFACT_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+}
+_SVG_ARTIFACT_HEADERS = {
+    **_ARTIFACT_HEADERS,
+    "Content-Security-Policy": (
+        "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'"
+    ),
+}
 
 
 @app.get("/projects/{name}/runs/{run_name}/files/{filename:path}")
@@ -737,7 +800,12 @@ def run_file(name: str, run_name: str, filename: str):
         raise HTTPException(404, "not a file")
     if target.suffix.lower() not in _ALLOWED_RUN_FILE_SUFFIXES:
         raise HTTPException(403, f"suffix {target.suffix} not allowed")
-    return FileResponse(target)
+    suffix = target.suffix.lower()
+    if suffix == ".svg":
+        return FileResponse(target, media_type="image/svg+xml", headers=_SVG_ARTIFACT_HEADERS)
+    if suffix == ".png":
+        return FileResponse(target, media_type="image/png", headers=_ARTIFACT_HEADERS)
+    return FileResponse(target, media_type="text/plain", headers=_ARTIFACT_HEADERS)
 
 
 @app.get(
@@ -794,6 +862,7 @@ def glossary_page(request: Request):
 @app.post("/settings")
 async def settings_save(request: Request):
     form = await request.form()
+    _require_trusted_post(request, form.get(_CSRF_FIELD))
     entries: list[ModelEntry] = []
     for role in ROLES:
         provider = (form.get(f"{role}__provider") or "").strip()

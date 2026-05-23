@@ -40,6 +40,27 @@ def test_table_rendered_via_extra_extension():
 def test_link_rendered():
     html = render("[click](https://example.com)")
     assert 'href="https://example.com"' in html
+    assert 'rel="noopener noreferrer"' in html
+
+
+def test_raw_html_is_escaped():
+    html = render("<script>alert(1)</script>\n\n<img src=x onerror=alert(1)>")
+    assert "<script>" not in html
+    assert "<img" not in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+    assert "&lt;img src=x onerror=alert(1)&gt;" in html
+
+
+def test_javascript_link_href_is_removed():
+    html = render("[click](javascript:alert(1))")
+    assert "javascript:" not in html
+    assert "<a>click</a>" in html
+
+
+def test_code_less_than_is_preserved_when_html_is_disabled():
+    html = render("```c\nif (a < b) return;\n```")
+    assert "if (a &lt; b) return;" in html
+    assert "&amp;lt;" not in html
 
 
 def test_sequential_renders_are_independent():
